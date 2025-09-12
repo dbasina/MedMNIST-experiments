@@ -1,0 +1,4 @@
+retinamnist
+train  auc: 0.78618  acc: 0.53056
+val  auc: 0.80843  acc: 0.52500
+test  auc: 0.74996  acc: 0.50500

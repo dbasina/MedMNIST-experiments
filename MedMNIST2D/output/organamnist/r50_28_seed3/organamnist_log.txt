@@ -1,0 +1,4 @@
+organamnist
+train  auc: 1.00000  acc: 1.00000
+val  auc: 0.99990  acc: 0.98198
+test  auc: 0.99697  acc: 0.93711

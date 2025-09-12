@@ -1,4 +1,0 @@
-chestmnist
-train  auc: 0.75769  acc: 0.94906
-val  auc: 0.71754  acc: 0.94905
-test  auc: 0.71271  acc: 0.94766

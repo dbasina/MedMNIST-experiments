@@ -1,0 +1,4 @@
+tissuemnist
+train  auc: 0.94517  acc: 0.70431
+val  auc: 0.92184  acc: 0.65833
+test  auc: 0.92270  acc: 0.65884

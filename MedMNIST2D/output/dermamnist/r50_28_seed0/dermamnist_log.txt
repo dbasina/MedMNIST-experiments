@@ -1,0 +1,4 @@
+dermamnist
+train  auc: 0.94862  acc: 0.79192
+val  auc: 0.91847  acc: 0.74377
+test  auc: 0.91608  acc: 0.72618

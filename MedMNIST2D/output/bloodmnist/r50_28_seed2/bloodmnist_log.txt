@@ -1,0 +1,4 @@
+bloodmnist
+train  auc: 1.00000  acc: 1.00000
+val  auc: 0.99682  acc: 0.95152
+test  auc: 0.99583  acc: 0.95001
