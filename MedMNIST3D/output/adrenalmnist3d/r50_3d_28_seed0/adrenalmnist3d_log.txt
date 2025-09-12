@@ -1,0 +1,4 @@
+adrenalmnist3d
+train  auc: 0.96351  acc: 0.91751
+val  auc: 0.86902  acc: 0.81633
+test  auc: 0.84988  acc: 0.81879

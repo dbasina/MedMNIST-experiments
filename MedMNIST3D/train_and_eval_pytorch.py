@@ -6,24 +6,65 @@ from copy import deepcopy
 
 import medmnist
 import numpy as np
+import PIL
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 import torchvision.transforms as transforms
+import random
+import torch.distributed as dist
+
 from acsconv.converters import ACSConverter, Conv2_5dConverter, Conv3dConverter
+from utils import Transform3D  # same helper your 3D script uses
+from torch.nn.parallel import DistributedDataParallel as DDP
 from medmnist import INFO, Evaluator
 from models import ResNet18, ResNet50
 from tensorboardX import SummaryWriter
+from torchvision.models import resnet18, resnet50
 from tqdm import trange
-from utils import Transform3D, model_to_syncbn
+from utils import model_to_syncbn
+CHANNELS_LAST_3D = getattr(torch, "channels_last_3d", torch.contiguous_format)
+
+def _is_training_ckpt(d):
+    return isinstance(d, dict) and 'optimizer' in d and 'epoch' in d and 'scheduler' in d and 'net' in d
+
+def ddp_is_init():
+    return dist.is_available() and dist.is_initialized()
+
+def ddp_rank():
+    return dist.get_rank() if ddp_is_init() else 0
+
+def is_main_process():
+    return ddp_rank() == 0
+
+def setup_ddp():
+    """Initialize DDP from torchrun environment."""
+    local_rank = int(os.environ["LOCAL_RANK"])     # 0..(nproc_per_node-1)
+    torch.cuda.set_device(local_rank)              # <-- set device FIRST
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return local_rank
+
+def cleanup_ddp():
+    if ddp_is_init():
+        dist.destroy_process_group()
+
+def unwrap(m):
+    return m.module if isinstance(m, (DDP, torch.nn.DataParallel)) else m
+
+def set_seed(seed, rank = 0):
+    seed = int(seed) + int(rank)*1000
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, conv, pretrained_3d, download, model_flag, as_rgb, shape_transform, model_path, run):
 
+def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, resume, ckpt_every, seed, distributed, per_gpu_batch, conv, pretrained_3d, shape_transform):
+    is_3d = data_flag.endswith('3d') 
     lr = 0.001
     gamma=0.1
-    milestones = [0.5 * num_epochs, 0.75 * num_epochs]
 
     info = INFO[data_flag]
     task = info['task']
@@ -31,113 +72,264 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, conv, pr
     n_classes = len(info['label'])
 
     DataClass = getattr(medmnist, info['python_class'])
+
+    if distributed:
+        local_rank = setup_ddp()
+        device = torch.device(f'cuda:{local_rank}')
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        str_ids = gpu_ids.split(',')
+        gpu_ids = []
+        for str_id in str_ids:
+            id = int(str_id)
+            if id >= 0:
+                gpu_ids.append(id)
+        if len(gpu_ids) > 0:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(i) for i in gpu_ids)
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        world_size = 1
+        rank = 0
+    set_seed(seed, rank)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+
+    # If resuming from a checkpoint, reuse that folder. Otherwise create a fresh timestamped run dir.
+    run_dir = os.path.join(output_root, data_flag, run)
+    if model_path is not None and resume:
+        # trust the checkpoint location for safety
+        output_root = os.path.dirname(os.path.abspath(model_path))
+    else:
+        output_root = run_dir
     
-    str_ids = gpu_ids.split(',')
-    gpu_ids = []
-    for str_id in str_ids:
-        id = int(str_id)
-        if id >= 0:
-            gpu_ids.append(id)
-    if len(gpu_ids) > 0:
-        os.environ["CUDA_VISIBLE_DEVICES"]=str(gpu_ids[0])
+    if is_main_process():
+        os.makedirs(output_root, exist_ok=True)
+    if distributed:
+        dist.barrier(device_ids=[device.index])
 
-    device = torch.device('cuda:{}'.format(gpu_ids[0])) if gpu_ids else torch.device('cpu') 
-    
-        
-    output_root = os.path.join(output_root, data_flag, time.strftime("%y%m%d_%H%M%S"))
-    if not os.path.exists(output_root):
-        os.makedirs(output_root)
+    if is_main_process():
+        print('==> Preparing data...')
+        print('==> Building and training model...')
 
-    print('==> Preparing data...')
+    if is_3d:
+        # 3D: use the same Transform3D
+        train_transform = Transform3D(mul='random') if shape_transform else Transform3D()
+        eval_transform  = Transform3D(mul='0.5')    if shape_transform else Transform3D()
+    else:
+        if as_rgb:
+            mean, std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+        else:
+            mean, std = [0.5], [0.5]
 
-    train_transform = Transform3D(mul='random') if shape_transform else Transform3D()
-    eval_transform = Transform3D(mul='0.5') if shape_transform else Transform3D()
+        if resize:
+            data_transform = transforms.Compose(
+                [transforms.Resize((224, 224), interpolation=PIL.Image.BILINEAR), 
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)])
+        else:
+            data_transform = transforms.Compose(
+                [transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)])
      
-    train_dataset = DataClass(split='train', transform=train_transform, download=download, as_rgb=as_rgb, size=size)
-    train_dataset_at_eval = DataClass(split='train', transform=eval_transform, download=download, as_rgb=as_rgb, size=size)
-    val_dataset = DataClass(split='val', transform=eval_transform, download=download, as_rgb=as_rgb, size=size)
-    test_dataset = DataClass(split='test', transform=eval_transform, download=download, as_rgb=as_rgb, size=size)
+    do_dl = download and ((not distributed) or is_main_process())
 
+# --- Datasets ---
+    if is_3d:
+        # Train uses random Transform3D, eval uses deterministic Transform3D
+        train_dataset      = DataClass(split='train', transform=train_transform, download=do_dl, as_rgb=as_rgb, size=size)
+        train_dataset_eval = DataClass(split='train', transform=eval_transform,   download=do_dl, as_rgb=as_rgb, size=size)
+        val_dataset        = DataClass(split='val',   transform=eval_transform,   download=do_dl, as_rgb=as_rgb, size=size)
+        test_dataset       = DataClass(split='test',  transform=eval_transform,   download=do_dl, as_rgb=as_rgb, size=size)
+    else:
+        # 2D baseline: same transform is fine for train/eval copy of the train split
+        train_dataset      = DataClass(split='train', transform=data_transform, download=do_dl, as_rgb=as_rgb, size=size)
+        train_dataset_eval = train_dataset  # use the same data/transform for train-set evaluation
+        val_dataset        = DataClass(split='val',   transform=data_transform, download=do_dl, as_rgb=as_rgb, size=size)
+        test_dataset       = DataClass(split='test',  transform=data_transform, download=do_dl, as_rgb=as_rgb, size=size)
+
+    if distributed:
+        dist.barrier(device_ids=[device.index])
+
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas= world_size, rank = rank, shuffle = True, drop_last = False)
+    else:
+        train_sampler = None
     
-    train_loader = data.DataLoader(dataset=train_dataset,
-                                batch_size=batch_size,
-                                shuffle=True)
-    train_loader_at_eval = data.DataLoader(dataset=train_dataset_at_eval,
-                                batch_size=batch_size,
-                                shuffle=False)
-    val_loader = data.DataLoader(dataset=val_dataset,
-                                batch_size=batch_size,
-                                shuffle=False)
-    test_loader = data.DataLoader(dataset=test_dataset,
-                                batch_size=batch_size,
-                                shuffle=False)
+    if distributed and not per_gpu_batch:
+        assert batch_size % world_size == 0, "global --batch_size must be divisible by world_size"
+        eff_batch = batch_size // world_size
+    else:
+        eff_batch = batch_size
 
-    print('==> Building and training model...')
 
+    lr = 1e-3
+    if is_main_process():
+        print(f"[info] per_gpu_batch={eff_batch} world_size={world_size} global_bs={eff_batch*world_size} lr={lr:.6g}", flush=True)
+
+    try:
+        # how many CPUs are *actually* available to this process
+        avail_cpu = len(os.sched_getaffinity(0))
+    except AttributeError:
+        avail_cpu = os.cpu_count() or 4
+
+    per_proc_cpu = max(1, avail_cpu // max(1, world_size))
+    # Cap to 4 unless you confirm higher is stable on this cluster
+    train_workers = min(4, per_proc_cpu)
+    eval_workers  = max(1, min(2, train_workers))
+
+    train_loader = data.DataLoader(
+        dataset=train_dataset,
+        batch_size=eff_batch,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=train_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last = False,
+    )
+
+    eval_kwargs = dict(
+        batch_size=eff_batch,
+        shuffle=False,
+        num_workers=eval_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2
+    )
+    train_loader_at_eval = data.DataLoader(dataset=train_dataset_eval, **eval_kwargs)
+    val_loader   = data.DataLoader(dataset=val_dataset, **eval_kwargs)
+    test_loader  = data.DataLoader(dataset=test_dataset, **eval_kwargs)
+    
     if model_flag == 'resnet18':
-        model = ResNet18(in_channels=n_channels, num_classes=n_classes)
+        model =  resnet18(pretrained=False, num_classes=n_classes) if resize else ResNet18(in_channels=n_channels, num_classes=n_classes)
     elif model_flag == 'resnet50':
-        model = ResNet50(in_channels=n_channels, num_classes=n_classes)
+        model =  resnet50(pretrained=False, num_classes=n_classes) if resize else ResNet50(in_channels=n_channels, num_classes=n_classes)
     else:
         raise NotImplementedError
 
-    if conv=='ACSConv':
-        model = model_to_syncbn(ACSConverter(model))
-    if conv=='Conv2_5d':
-        model = model_to_syncbn(Conv2_5dConverter(model))
-    if conv=='Conv3d':
-        if pretrained_3d == 'i3d':
-            model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=-3))
-        else:
-            model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=None))
-    
+    if is_3d:
+        if conv == 'ACSConv':
+            model = ACSConverter(model)
+        elif conv == 'Conv2_5d':
+            model = Conv2_5dConverter(model)
+        elif conv == 'Conv3d':
+            i3d_axis = -3 if pretrained_3d == 'i3d' else None
+            model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=i3d_axis))
+
     model = model.to(device)
+    if not is_3d:
+        model = model.to(memory_format=torch.channels_last)
+
+
+    if distributed:
+        # Convert BN -> SyncBN BEFORE DDP wrap
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+        )
 
     train_evaluator = medmnist.Evaluator(data_flag, 'train', size=size)
     val_evaluator = medmnist.Evaluator(data_flag, 'val', size=size)
     test_evaluator = medmnist.Evaluator(data_flag, 'test', size=size)
 
-    criterion = nn.CrossEntropyLoss()
+    if task == "multi-label, binary-class":
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
 
+
+    # Paper scheduler: MultiStepLR at 50% and 75% of total epochs
+    milestones = [int(0.5 * num_epochs), int(0.75 * num_epochs)]
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
+
+
+    start_epoch = 0
+    best_auc = 0.0
+    best_epoch = -1
+    best_state = None 
+
+    # --- Resume or evaluate-only logic ---
     if model_path is not None:
-        model.load_state_dict(torch.load(model_path, map_location=device)['net'], strict=True)
-        train_metrics = test(model, train_evaluator, train_loader_at_eval, criterion, device, run, output_root)
-        val_metrics = test(model, val_evaluator, val_loader, criterion, device, run, output_root)
-        test_metrics = test(model, test_evaluator, test_loader, criterion, device, run, output_root)
+        ckpt = torch.load(model_path, map_location=device, weights_only= False)
+        print(f"[resume] loading: {model_path}", flush=True)
 
-        print('train  auc: %.5f  acc: %.5f\n' % (train_metrics[1], train_metrics[2]) + \
-              'val  auc: %.5f  acc: %.5f\n' % (val_metrics[1], val_metrics[2]) + \
-              'test  auc: %.5f  acc: %.5f\n' % (test_metrics[1], test_metrics[2]))
+        if resume:
+            if not _is_training_ckpt(ckpt):
+                raise ValueError(f"--resume requested but {model_path} is not a training checkpoint.")
+            # handle new/old formats
+            net_key = 'net_current' if 'net_current' in ckpt else 'net'
+            unwrap(model).load_state_dict(ckpt[net_key], strict=True)
+            optimizer.load_state_dict(ckpt['optimizer'])
+            for g in optimizer.param_groups:
+                g['lr'] = lr
+            scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt.get('epoch', 0) + 1
+            best_auc   = ckpt.get('best_auc', 0.0)
+            best_epoch = ckpt.get('best_epoch', -1)
+            # try to restore best_model too
+            if 'net_best' in ckpt and ckpt['net_best'] is not None:
+                best_state = ckpt['net_best']
+            print(f"=> Resumed from ckpt_epoch={ckpt.get('epoch')} -> start_epoch={start_epoch} | best_auc={best_auc:.5f} @ epoch {best_epoch}")
+            # one-time sanity eval
+            if (not distributed) or is_main_process():
+                model.eval()
+                with torch.no_grad():
+                    sanity_val = test(model, val_evaluator, val_loader, is_3d,task, criterion, device, run + "_resume_sanity", output_root)
+                print(f"[resume] sanity val: auc={sanity_val[1]:.5f} acc={sanity_val[2]:.5f}")
+                model.train()
+
+        else:
+            # Weight-only file (e.g., best_model.pth): load weights then evaluate-only or continue fresh schedule
+            unwrap(model).load_state_dict(ckpt['net'], strict=True)
+            print("=> Loaded weights only (no optimizer/scheduler state).")
+            # You can still do the three immediate evaluations below if desired:
+            train_metrics = test(model, train_evaluator, train_loader_at_eval, is_3d, task, criterion, device, run, output_root)
+            val_metrics   = test(model,  val_evaluator,  val_loader,  is_3d, task, criterion, device, run, output_root)
+            test_metrics  = test(model,  test_evaluator, test_loader,  is_3d, task, criterion, device, run, output_root)
+            print('train  auc: %.5f  acc: %.5f\nval    auc: %.5f  acc: %.5f\ntest   auc: %.5f  acc: %.5f\n'
+                % (train_metrics[1], train_metrics[2], val_metrics[1], val_metrics[2], test_metrics[1], test_metrics[2]))
 
     if num_epochs == 0:
         return
 
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
-    
     logs = ['loss', 'auc', 'acc']
     train_logs = ['train_'+log for log in logs]
     val_logs = ['val_'+log for log in logs]
     test_logs = ['test_'+log for log in logs]
     log_dict = OrderedDict.fromkeys(train_logs+val_logs+test_logs, 0)
     
-    writer = SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results'))
-
-    best_auc = 0
-    best_epoch = 0
-    best_model = deepcopy(model)
+    writer = SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results')) if is_main_process() else None
 
     global iteration
     iteration = 0
+    last_epoch = start_epoch - 1
 
-    for epoch in trange(num_epochs):
+    for epoch in trange(start_epoch, num_epochs):
+        if distributed and train_loader.sampler is not None:
+            train_loader.sampler.set_epoch(epoch)
+        last_epoch = epoch     
+        train_loss = train(model, train_loader, is_3d, task, criterion, optimizer, device, writer)
         
-        train_loss = train(model, train_loader, criterion, optimizer, device, writer)
-        
-        train_metrics = test(model, train_evaluator, train_loader_at_eval, criterion, device, run)
-        val_metrics = test(model, val_evaluator, val_loader, criterion, device, run)
-        test_metrics = test(model, test_evaluator, test_loader, criterion, device, run)
+        if (not distributed) or is_main_process():
+
+            train_metrics = [train_loss, 0.0, 0.0]          # skip full train-set eval
+            val_metrics   = test(model, val_evaluator, val_loader, is_3d, task, criterion, device, run)
+
+            if val_metrics[1] > best_auc:
+                # Only now run test (and save ckpt)
+                test_metrics = test(model, test_evaluator, test_loader, is_3d,task, criterion, device, run)
+            else:
+                test_metrics = [0.0, 0.0, 0.0]
+        else:
+            train_metrics = val_metrics = test_metrics = [0.0,0.0,0.0]
         
         scheduler.step()
         
@@ -148,104 +340,151 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, conv, pr
         for i, key in enumerate(test_logs):
             log_dict[key] = test_metrics[i]
 
-        for key, value in log_dict.items():
-            writer.add_scalar(key, value, epoch)
+        if writer is not None:
+            for key, value in log_dict.items():
+                writer.add_scalar(key, value, epoch)
             
         cur_auc = val_metrics[1]
         if cur_auc > best_auc:
             best_epoch = epoch
             best_auc = cur_auc
-            best_model = deepcopy(model)
+            best_state = deepcopy(unwrap(model).state_dict())
+            if is_main_process():
+                print('cur_best_val_auc:', best_auc)
+                print('cur_val_acc:', val_metrics[2])
+                print('cur_test_auc:', test_metrics[1])
+                print('cur_test_acc:', test_metrics[2])
+                print('cur_best_epoch', best_epoch)
 
-            print('cur_best_auc:', best_auc)
-            print('cur_best_epoch', best_epoch)
+        
+        ckpt_last = {
+            'epoch': epoch,
+            'net': unwrap(model).state_dict(),   # current weights
+            'net_best': best_state,              # may be None early on
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_auc': best_auc,
+            'best_epoch': best_epoch,
+            'data_flag': data_flag,
+            'run': run,
+        }
+        if is_main_process():
+            torch.save(ckpt_last, os.path.join(output_root, 'ckpt_last.pth'))
+            if ckpt_every and ckpt_every > 0 and (epoch + 1) % ckpt_every == 0:
+                torch.save(ckpt_last, os.path.join(output_root, f'ckpt_epoch{epoch:03d}.pth'))
+            if best_epoch == epoch and best_state is not None:
+                torch.save(ckpt_last, os.path.join(output_root, 'ckpt_best.pth'))
 
-    state = {
-        'net': model.state_dict(),
-    }
 
-    path = os.path.join(output_root, 'best_model.pth')
-    torch.save(state, path)
 
-    train_metrics = test(best_model, train_evaluator, train_loader_at_eval, criterion, device, run, output_root)
-    val_metrics = test(best_model, val_evaluator, val_loader, criterion, device, run, output_root)
-    test_metrics = test(best_model, test_evaluator, test_loader, criterion, device, run, output_root)
+    if is_main_process() and best_state is not None:
+        torch.save({'net': best_state}, os.path.join(output_root, 'best_model.pth'))
 
-    train_log = 'train  auc: %.5f  acc: %.5f\n' % (train_metrics[1], train_metrics[2])
-    val_log = 'val  auc: %.5f  acc: %.5f\n' % (val_metrics[1], val_metrics[2])
-    test_log = 'test  auc: %.5f  acc: %.5f\n' % (test_metrics[1], test_metrics[2])
 
-    log = '%s\n' % (data_flag) + train_log + val_log + test_log + '\n'
-    print(log)
+    # Final eval on the BEST weights
+    if (not distributed) or is_main_process():
+        eval_model = deepcopy(model)               # same arch/device/SyncBN/DDP unwrap ok
+        if best_state is not None:
+            unwrap(eval_model).load_state_dict(best_state, strict=True)
+
+        train_metrics = test(eval_model, train_evaluator, train_loader_at_eval, is_3d, task, criterion, device, run, output_root)
+        val_metrics   = test(eval_model,  val_evaluator,  val_loader,          is_3d, task, criterion, device, run, output_root)
+        test_metrics  = test(eval_model,  test_evaluator, test_loader,         is_3d, task, criterion, device, run, output_root)
+    else:
+        train_metrics = val_metrics = test_metrics = [0.0, 0.0, 0.0]
+
+
+    if distributed:
+        dist.barrier(device_ids=[device.index])
+
+    if (not distributed) or is_main_process():
+        train_log = 'train  auc: %.5f  acc: %.5f\n' % (train_metrics[1], train_metrics[2])
+        val_log = 'val  auc: %.5f  acc: %.5f\n' % (val_metrics[1], val_metrics[2])
+        test_log = 'test  auc: %.5f  acc: %.5f\n' % (test_metrics[1], test_metrics[2])
+
+        log = '%s\n' % (data_flag) + train_log + val_log + test_log
+        
+        print(log)
+                
+        with open(os.path.join(output_root, '%s_log.txt' % (data_flag)), 'a') as f:
+            f.write(log) 
     
-    with open(os.path.join(output_root, '%s_log.txt' % (data_flag)), 'a') as f:
-        f.write(log)        
-            
-    writer.close()
+    if writer is not None:        
+        writer.close()
+
+    if distributed:
+        cleanup_ddp()
 
 
-def train(model, train_loader, criterion, optimizer, device, writer):
+def train(model, train_loader, is_3d, task, criterion, optimizer, device, writer):
     total_loss = []
     global iteration
 
     model.train()
+    use_amp = (device.type == 'cuda')
     for batch_idx, (inputs, targets) in enumerate(train_loader):
-        optimizer.zero_grad()
-        outputs = model(inputs.to(device))
+        optimizer.zero_grad(set_to_none=True)
 
-        targets = torch.squeeze(targets, 1).long().to(device)
-        loss = criterion(outputs, targets)
+        memfmt = CHANNELS_LAST_3D if is_3d else torch.channels_last
+        inputs = inputs.to(device, non_blocking=True).to(memory_format=memfmt)
 
-        total_loss.append(loss.item())
-        writer.add_scalar('train_loss_logs', loss.item(), iteration)
-        iteration += 1
+        if task == 'multi-label, binary-class':
+            targets = targets.to(torch.float32).to(device, non_blocking=True)
+        else:
+            targets = torch.squeeze(targets, 1).long().to(device, non_blocking=True)
+
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         loss.backward()
         optimizer.step()
-    
+
+        total_loss.append(loss.item())
+        if writer is not None:
+            writer.add_scalar('train_loss_logs', loss.item(), iteration)
+        iteration += 1
+
     epoch_loss = sum(total_loss)/len(total_loss)
     return epoch_loss
 
 
-def test(model, evaluator, data_loader, criterion, device, run, save_folder=None):
+def test(model, evaluator, data_loader, is_3d, task, criterion, device, run, save_folder=None):
 
     model.eval()
-
     total_loss = []
-    y_score = torch.tensor([]).to(device)
-
+    y_chunks = []
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(data_loader):
-            outputs = model(inputs.to(device))
-        
-            targets = torch.squeeze(targets, 1).long().to(device)
-            loss = criterion(outputs, targets)
-            m = nn.Softmax(dim=1)
-            outputs = m(outputs).to(device)
-            targets = targets.float().resize_(len(targets), 1)
-
+        for inputs, targets in data_loader:
+            memfmt = CHANNELS_LAST_3D if is_3d else torch.channels_last
+            inputs = inputs.to(device, non_blocking=True).to(memory_format=memfmt)
+            outputs = model(inputs)
+            if task == 'multi-label, binary-class':
+                targets = targets.to(torch.float32).to(device, non_blocking=True)
+                loss = criterion(outputs, targets)
+                outputs = torch.sigmoid(outputs)
+            else:
+                targets = torch.squeeze(targets, 1).long().to(device, non_blocking=True)
+                loss = criterion(outputs, targets)
+                outputs = torch.softmax(outputs, dim=1)
             total_loss.append(loss.item())
-
-            y_score = torch.cat((y_score, outputs), 0)
-
-        y_score = y_score.detach().cpu().numpy()
-        auc, acc = evaluator.evaluate(y_score, save_folder, run)
-
-        test_loss = sum(total_loss) / len(total_loss)
-
-        return [test_loss, auc, acc]
+            y_chunks.append(outputs.detach().cpu())
+    y_score = torch.cat(y_chunks, dim=0).numpy()
+    auc, acc = evaluator.evaluate(y_score, save_folder, run)
+    test_loss = sum(total_loss) / len(total_loss)
+    return [test_loss, auc, acc]
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='RUN Baseline model of MedMNIST3D')
+        description='RUN Baseline model of MedMNIST2D')
 
     parser.add_argument('--data_flag',
-                        default='organmnist3d',
+                        default='pathmnist',
                         type=str)
     parser.add_argument('--output_root',
                         default='./output',
-                        help='output root, where to save models',
+                        help='output root, where to save models and results',
                         type=str)
     parser.add_argument('--num_epochs',
                         default=100,
@@ -253,28 +492,21 @@ if __name__ == '__main__':
                         type=int)
     parser.add_argument('--size',
                         default=28,
-                        help='the image size of the dataset, 28 or 64, default=28',
+                        help='the image size of the dataset, 28 or 64 or 128 or 224, default=28',
                         type=int)
     parser.add_argument('--gpu_ids',
                         default='0',
                         type=str)
     parser.add_argument('--batch_size',
-                        default=32,
+                        default=128,
                         type=int)
-    parser.add_argument('--conv',
-                        default='ACSConv',
-                        help='choose converter from Conv2_5d, Conv3d, ACSConv',
-                        type=str)
-    parser.add_argument('--pretrained_3d',
-                        default='i3d',
-                        type=str)
     parser.add_argument('--download',
                         action="store_true")
-    parser.add_argument('--as_rgb',
-                        help='to copy channels, tranform shape 1x28x28x28 to 3x28x28x28',
+    parser.add_argument('--resize',
+                        help='resize images of size 28x28 to 224x224',
                         action="store_true")
-    parser.add_argument('--shape_transform',
-                        help='for shape dataset, whether multiply 0.5 at eval',
+    parser.add_argument('--as_rgb',
+                        help='convert the grayscale image to RGB',
                         action="store_true")
     parser.add_argument('--model_path',
                         default=None,
@@ -282,14 +514,38 @@ if __name__ == '__main__':
                         type=str)
     parser.add_argument('--model_flag',
                         default='resnet18',
-                        help='choose backbone, resnet18/resnet50',
+                        help='choose backbone from resnet18, resnet50',
                         type=str)
     parser.add_argument('--run',
                         default='model1',
                         help='to name a standard evaluation csv file, named as {flag}_{split}_[AUC]{auc:.3f}_[ACC]{acc:.3f}@{run}.csv',
                         type=str)
+    parser.add_argument('--resume', 
+                        action='store_true',
+                        help='resume training from a checkpoint (provide --model_path)')
+    parser.add_argument('--ckpt_every', 
+                        type=int, default=1,
+                        help='save a checkpoint every N epochs (default: 1)')
+    parser.add_argument('--seed', 
+                        type=int, default=0,
+                        help='random seed for reproducibility')
+    parser.add_argument('--distributed', 
+                        action='store_true',
+                        help='Use DistributedDataParallel (torchrun).')
+    parser.add_argument('--per_gpu_batch', 
+                        action='store_true',
+                        help='Interpret --batch_size as per-GPU batch size. ''If not set, batch_size is global and will be split across ranks.')
+    parser.add_argument('--conv', default='none',
+                    choices=['none','ACSConv','Conv2_5d','Conv3d'],
+                    help='3D converter to apply when data_flag ends with 3d')
+    parser.add_argument('--pretrained_3d', default='i3d',
+                        choices=['i3d','none'],
+                        help='Conv3dConverter repeat policy (i3d uses temporal repeat)')
+    parser.add_argument('--shape_transform', action='store_true',
+                        help='Use Transform3D(mul="random") for train and mul="0.5" for eval (as in the benchmark)')
 
 
+    
     args = parser.parse_args()
     data_flag = args.data_flag
     output_root = args.output_root
@@ -297,13 +553,20 @@ if __name__ == '__main__':
     size = args.size
     gpu_ids = args.gpu_ids
     batch_size = args.batch_size
-    conv = args.conv
-    pretrained_3d = args.pretrained_3d
     download = args.download
     model_flag = args.model_flag
+    resize = args.resize
     as_rgb = args.as_rgb
     model_path = args.model_path
-    shape_transform = args.shape_transform
     run = args.run
+    resume = args.resume
+    ckpt_every = args.ckpt_every
+    seed = args.seed
+    distributed = args.distributed
+    per_gpu_batch = args.per_gpu_batch
 
-    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, conv, pretrained_3d, download, model_flag, as_rgb, shape_transform, model_path, run)
+    conv = args.conv
+    pretrained_3d = args.pretrained_3d
+    shape_transform = args.shape_transform
+
+    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, resume, ckpt_every, seed, distributed, per_gpu_batch, conv, pretrained_3d, shape_transform)

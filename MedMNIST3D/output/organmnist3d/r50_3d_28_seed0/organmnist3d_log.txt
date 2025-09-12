@@ -1,0 +1,4 @@
+organmnist3d
+train  auc: 0.99982  acc: 0.96395
+val  auc: 0.99991  acc: 0.96273
+test  auc: 0.98482  acc: 0.80000
